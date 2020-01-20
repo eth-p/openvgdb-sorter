@@ -1,0 +1,138 @@
+#!/usr/bin/env php
+<?php
+
+$OPTIONS = [
+	'input'    => null,
+	'output'   => null,
+	'database' => 'openvgdb.zip!openvgdb.sqlite'
+];
+
+// -------------------------------------------------------------------------------------------------
+// Functions
+// -------------------------------------------------------------------------------------------------
+
+function query_rom($hash) {
+	global $database;
+	$hash_safe = SQLite3::escapeString($hash);
+	$results = $database->query("
+		SELECT ROMs.romFileName, REGIONS.regionName, SYSTEMS.systemShortName, RELEASES.releaseTitleName
+		FROM 'ROMs'
+		INNER JOIN 'REGIONS' ON REGIONS.regionID = ROMs.regionID
+		INNER JOIN 'SYSTEMS' ON SYSTEMS.systemID = ROMs.systemID
+		INNER JOIN 'RELEASES' ON RELEASES.romID = ROMs.romID
+		WHERE ROMs.romHashSHA1 = '$hash_safe'
+	")->fetchArray(SQLITE3_ASSOC);
+
+	// If it didn't find a single row, return null.
+	if (!$results) return null;
+
+	// Return data.
+	$name_safe = preg_replace('/[^a-zA-Z0-9\-\_()\[\] ]+/', '', $results['releaseTitleName']);
+	$name_ext  = (array_reverse(explode('.', $results['romFileName'])))[0];
+	return [
+		'name'   => $results['releaseTitleName'],
+		'region' => $results['regionName'],
+		'system' => $results['systemShortName'],
+		'file'   => "${name_safe} (${results['regionName']}).${name_ext}"
+	];
+}
+
+function fatal($message) {
+	global $argv;
+	echo "${argv[0]}: $message";
+	exit(2);
+}
+
+
+// -------------------------------------------------------------------------------------------------
+// Parse Command Line
+// -------------------------------------------------------------------------------------------------
+
+$OPTIONS = array_merge($OPTIONS, getopt("", array_map(function($key) {
+	return "${key}::";
+}, array_keys($OPTIONS))));
+
+foreach ($OPTIONS as $key => $value) {
+	if ($value === null) {
+		echo "${argv[0]}: missing argument '--${key}'\n";
+		exit(1);
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// Extract Database
+// -------------------------------------------------------------------------------------------------
+
+$database_file   = null;
+if (strpos($OPTIONS['database'], '.zip!') !== false) {
+	$database_zip      = (explode('!', $OPTIONS['database'], 2))[0];
+	$database_zip_path = (explode('!', $OPTIONS['database'], 2))[1];
+
+	$zip_handle = zip_open($database_zip);
+	while ($zip_entry = zip_read($zip_handle)) {
+		if (zip_entry_name($zip_entry) === $database_zip_path) {
+			echo "Extracting database...\n";
+			zip_entry_open($zip_handle, $zip_entry, "r") or fatal("failed to extract archive.");
+
+			$database_file = tempnam(null, "vgdb");
+			$tempfile_handle = fopen($database_file, "w");
+			fwrite($tempfile_handle, zip_entry_read($zip_entry, zip_entry_filesize($zip_entry)));
+			fclose($tempfile_handle);
+			zip_entry_close($zip_entry);
+			zip_close($zip_handle);
+			break;
+		}
+	}
+} else {
+	$database_file = $OPTIONS['database'];
+}
+
+if ($database_file == null) {
+	echo "${argv[0]}: failed to extract OpenVGDB database\n";
+	exit(1);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Extract Database
+// -------------------------------------------------------------------------------------------------
+echo "Reading database...\n";
+$database = new SQLite3($database_file);
+
+// -------------------------------------------------------------------------------------------------
+// Sort
+// -------------------------------------------------------------------------------------------------
+echo "Sorting dumps...\n";
+
+$output       = $OPTIONS['output'];
+$input        = $OPTIONS['input'];
+$input_handle = opendir($OPTIONS['input']) or fatal("failed to read directory: $input");
+while ($entry = readdir($input_handle)) {
+	if (substr($entry, 0, 1) === '.') continue;
+
+	$entry_path = "${input}/${entry}";
+	$entry_hash = strtoupper(sha1(file_get_contents($entry_path)));
+
+	echo "\n";
+	echo " - $entry\n";
+	echo "   \\- SHA1: $entry_hash\n";
+
+	$entry_info = query_rom($entry_hash);
+	if ($entry_info == null) {
+		echo "   \\- !!! UNKNOWN ROM !!!\n";
+		continue;
+	}
+
+	$entry_save_as  = "${output}/${entry_info['system']}/${entry_info['region']}/${entry_info['file']}";
+	$entry_save_dir = dirname($entry_save_as);
+	if (!is_dir($entry_save_dir)) mkdir(dirname($entry_save_as), 0777, true);
+
+	echo "      ...\n";
+	echo "   \\- Title:  ${entry_info['name']}\n";
+	echo "   \\- System: ${entry_info['system']}\n";
+	echo "   \\- Region: ${entry_info['region']}\n";
+	echo "      ...\n";
+	echo "   \\- Saving as: ${entry_save_as}\n";
+
+	rename($entry_path, $entry_save_as);
+}
+
